@@ -1,0 +1,948 @@
+# -*- coding: utf-8 -*-
+"""
+iomux_gen.py — Excel → SystemVerilog IO Mux Generator
+
+핵심:
+- 시트 자동 탐색( --sheet 생략 가능)
+- PAD type: -pad_type PDIDWUWSWCDG I  /  -pad_type PDDWUWSWCDG IO
+  (엑셀의 _V/_H 접미사는 무시하고 매칭)
+- -mux_exclude 여러 번, 다비트(OM[0]..OM[N])도 base 이름으로 제외
+- OE 네이밍: <base>_oe (AH) / <base>_oen,<base>_oe_n,<base>_oen_n (AL)
+- ‘…gpio’ 로 끝나는 신호는 GPIO-like 포트셋 확장(oen,i,pe_pu,ps_pd,st,ie,ds,c)
+- 동일 베이스 버스폭이 서브모드 간 다르면 [U903]
+- sub_mode:
+  * IO 출력은 test_en 으로 게이트하지 않고 test_io[*].I 에 ‘직결’
+  * nand_tree: if_pad_in/io 만 포트 생성, 입력(.C)들을 nt 표기→엑셀행순으로 NAND 체인
+- mode_mux:
+  * 동일 이름 포트는 하나만 선언, 서브모드 출력들을 OR/게이팅하여 MUX
+  * clock anchor buffer (C 경로) 삽입
+- pad_mux:
+  * 각 base 옆에 대응 enable 포트도 함께 선언/연결
+  * PAD 인스턴스 이름에 비트 인덱스는 _%03d 형으로 0패딩
+- 정렬:
+  * 포트/선언/assign/인스턴스 연결 좌우폭 자동 계산
+  * 대괄호 숫자 우정렬(예: [ 9:0], [108])
+"""
+
+import os, re, sys
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Set
+
+try:
+    import openpyxl
+except Exception:
+    print("[U901] openpyxl import failed. Please `pip install openpyxl`.", file=sys.stderr)
+    sys.exit(3)
+
+# ---------- Error IDs ----------
+EID = {
+    "F101":"Excel merge/markers not found (Pin Group/Pin Name/PAD type rows missing)",
+    "F102":"Mode/Submode header not found",
+    "F103":"Pin Name duplicated",
+    "P201":"PAD type capability not provided (-pad_type)",
+    "P202":"I-only PAD has O/IO direction",
+    "P203":"Forbidden PAD must not be MUXed (OM/XIN/XOUT/PORn)",
+    "O301":"OM value out of range",
+    "O302":"OM value duplicated across submodes",
+    "O304":"Conflicting OM definitions for same submode",
+    "C403":"OE must be '<signal>_oe' (AH) or '<signal>_oen'/'<signal>_oe_n' (AL)",
+    "S701":"-mux_exclude but Excel defines mapping",
+    "U901":"Unexpected error",
+    "U902":"Mixed directions for same signal base",
+    "U903":"Inconsistent bus width across submodes for same signal",
+}
+
+class SpecError(Exception):
+    def __init__(self, eid: str, ctx: Optional[Dict[str, Any]]=None):
+        super().__init__(f"[{eid}] {EID.get(eid,eid)}")
+        self.eid=eid; self.ctx=ctx or {}
+    def pretty(self)->str:
+        c=" ".join(f"{k}={v}" for k,v in self.ctx.items())
+        return f"[{self.eid}] {EID.get(self.eid,self.eid)}" + (f" | {c}" if c else "")
+
+# ---------- utils ----------
+def norm(x: Any)->str: return "" if x is None else str(x).strip()
+def nlow(x: Any)->str: return norm(x).lower()
+def sv_id(s:str)->str: return "".join(ch if (ch.isalnum() or ch in "_$[]") else "_" for ch in s)
+def strip_idx(s:str)->str: return re.sub(r"\[.*\]$", "", s or "")
+def padtype_key(s: Any)->str:
+    t=norm(s); return re.split(r"[_\s(]", t, 1)[0] if t else ""
+def pad_orientation(s: Any)->str:
+    t=norm(s); m=re.search(r"_([HV])\b", t); return (m.group(1) if m else "V")
+def classify_mode(x:Any)->Optional[str]:
+    t=nlow(x)
+    if t.startswith("normal"): return "normal"
+    if t.startswith("scan"):   return "scan"
+    if t.startswith("ipdt"):   return "ipdt"
+    return None
+
+# 우정렬/정렬 도우미
+def idx_r(i:int, W:int)->str:  return f"[{i:>{max(1,W)}}]"
+def align_bracket_num(txt: str, width: int) -> str:
+    if width<=0: return ""
+    s=(txt or "").strip()
+    if not s: return " " * width
+    if s[0]=="[" and s[-1]=="]": return "[" + s[1:-1].rjust(width-2) + "]"
+    return s.rjust(width)
+
+def align_ports(entries: List[Dict[str,str]])->Tuple[List[str], int]:
+    if not entries: return [], 0
+    DIR_W = max((len(e["direction"]) for e in entries if not e.get("iface")), default=0)
+    TYP_W = max((len(e["type"])      for e in entries if not e.get("iface")), default=0)
+    IF_W  = max((len(e["iface"])     for e in entries if e.get("iface")),     default=0)
+    LEFT_W = max(IF_W, (DIR_W + (1 if TYP_W>0 else 0) + TYP_W))
+    BITS_W = max(len(e["bits"])  for e in entries) if entries else 0
+    ARR_W  = max(len(e["array"]) for e in entries) if entries else 0
+    NAME_W = max(len(e["name"])  for e in entries) if entries else 0
+    lines=[]
+    for i,e in enumerate(entries):
+        if e.get("iface"):
+            left=e["iface"].ljust(LEFT_W)
+        else:
+            left=(e["direction"].ljust(DIR_W) + (" " if TYP_W>0 else "") +
+                  e["type"].ljust(LEFT_W - DIR_W - (1 if TYP_W>0 else 0)))
+        bits=align_bracket_num(e["bits"], BITS_W)
+        arr=(" " + align_bracket_num(e["array"], ARR_W)) if e["array"] else " "*(ARR_W+1 if ARR_W>0 else 1)
+        comma="," if i<len(entries)-1 else ""
+        lines.append(f"  {left}  {bits}  {e['name']:<{NAME_W}}{arr}{comma}")
+    return lines, 2
+
+def align_decls(decls: List[Tuple[str,str,str]])->List[str]:
+    if not decls: return []
+    T_W=max(len(t) for t,_,_ in decls)
+    B_W=max(len(b) for _,b,_ in decls)
+    N_W=max(len(n) for _,_,n in decls)
+    return [f"  {t.ljust(T_W)}  {align_bracket_num(b,B_W)}  {n};" for t,b,n in decls]
+
+def align_assign_pairs(pairs: List[Tuple[str,str]])->List[str]:
+    if not pairs: return []
+    L_W=max(len(lhs) for lhs,_ in pairs)
+    return [f"  assign {lhs.ljust(L_W)} = {rhs};" for lhs,rhs in pairs]
+
+def align_instance(conns: List[Tuple[str,str]])->List[str]:
+    PW=max(len(k) for k,_ in conns); VW=max(len(v) for _,v in conns)
+    out=["  ("]
+    for i,(k,v) in enumerate(conns):
+        comma="," if i<len(conns)-1 else ""
+        out.append(f"    {k.ljust(PW)} ( {v.ljust(VW)} ){comma}")
+    out.append("  );"); return out
+
+def fmt_if(ifname: str, idx: int, field: str, idxW: int, fieldW: int) -> str:
+    return f"{ifname}{idx_r(idx, idxW)}.{field.ljust(fieldW)}"
+def fmt_vec(name: str, idx: int, idxW: int) -> str:
+    return f"{name}{idx_r(idx, idxW)}"
+
+# ---------- OM 파서 ----------
+def parse_om_values(s: Any) -> List[int]:
+    out=[]; text=norm(s)
+    if not text: return out
+    text=re.sub(r"(?i)\bom\s*=\s*","",text)
+    parts=[p.strip() for p in text.split(",") if p.strip()]
+    def nl(t:str)->str:
+        t=t.strip()
+        t=re.sub(r"(?i)\b\d+\s*'\s*h\s*([0-9a-f]+)\b", r"0x\1", t)
+        t=re.sub(r"(?i)\b\d+\s*'\s*d\s*([0-9]+)\b", r"\1", t)
+        if re.fullmatch(r"[0-9A-Fa-f]+", t) and re.search(r"[A-Fa-f]", t): t="0x"+t
+        return t
+    def one(tok:str):
+        if "~" in tok:
+            a,b=[nl(x) for x in tok.split("~",1)]
+            va,vb=int(a,0),int(b,0); lo=min(va,vb); hi=max(va,vb)
+            return list(range(lo,hi+1))
+        return [int(nl(tok),0)]
+    for p in parts: out+=one(p)
+    uniq=[]; [uniq.append(v) for v in out if v not in uniq]
+    return uniq
+
+# ---------- 데이터 모델 ----------
+@dataclass
+class PadRow:
+    row:int; group:str; name:str; pad_type:str; kind:str; excluded:bool=False; index:int=-1
+
+@dataclass
+class SigCell:
+    base:str; base_idx:Optional[int]; enable:Optional[str]; enable_idx:Optional[int]
+    marker:str; direction:str; default_in:str; pad_kind:str; pad_index:int; pin_name:str
+    excel_row:int
+    nt_order:Optional[int] = None
+
+@dataclass
+class SubMode:
+    mode:str; name:str; om_values:List[int]; cells:List[SigCell]=field(default_factory=list); index:int=-1
+
+@dataclass
+class ExcelModel:
+    pads_I:List[PadRow]; pads_IO:List[PadRow]; pads_OSC:List[str]; modes:Dict[str,List[SubMode]]
+
+# ---------- 엑셀 읽기 ----------
+KW_PG="Pin Group"; KW_PN="Pin Name"; KW_PT="PAD type"
+NT_IN_RE = re.compile(r"(?i)(?:nt|nand(?:_tree)?)_in\[(\d+)\]")
+
+def load_grid(ws):
+    R,C=ws.max_row, ws.max_column
+    g=[[ws.cell(r,c).value for c in range(1,C+1)] for r in range(1,R+1)]
+    for rng in ws.merged_cells.ranges:
+        r0,c0,r1,c1=rng.min_row,rng.min_col,rng.max_row,rng.max_col
+        v=ws.cell(r0,c0).value
+        for r in range(r0,r1+1):
+            for c in range(c0,c1+1):
+                g[r-1][c-1]=v
+    return g
+
+def find_header_row(grid)->Tuple[int,Dict[str,int]]:
+    want=[nlow(KW_PG),nlow(KW_PN),nlow(KW_PT)]
+    for r,row in enumerate(grid):
+        idx={}
+        for c,v in enumerate(row):
+            nv=nlow(v)
+            if nv: idx.setdefault(nv,[]).append(c)
+        if all(w in idx for w in want):
+            return r,{KW_PG:idx[want[0]][0], KW_PN:idx[want[1]][0], KW_PT:idx[want[2]][0]}
+    raise SpecError("F101")
+
+def detect_spans(mode_row, sub_row, om_row):
+    spans={}
+    c=0; n=max(len(mode_row),len(sub_row),len(om_row))
+    while c<n:
+        m=classify_mode(mode_row[c] if c<len(mode_row) else None)
+        if not m: c+=1; continue
+        name=norm(sub_row[c]) if c<len(sub_row) else f"{m}_sub{c}"
+        c0=c; c+=1
+        while c<n:
+            m2=classify_mode(mode_row[c] if c<len(mode_row) else None)
+            n2=norm(sub_row[c]) if c<len(sub_row) else f"{m}_sub{c}"
+            if m2==m and n2==name: c+=1
+            else: break
+        c1=c-1
+        oms=parse_om_values(om_row[c0] if c0<len(om_row) else "")
+        key=(m,name)
+        if key in spans and spans[key][2]!=oms: raise SpecError("O304", {"mode":m,"submode":name})
+        spans[key]=(c0,c1,oms)
+    if not spans: raise SpecError("F102")
+    # Reserved는 생성 제외
+    spans={k:v for k,v in spans.items() if not re.search(r"reserved", k[1], re.I)}
+    return spans
+
+FORBIDDEN_BASES={"OM"}  # OM 계열은 MUX 대상 아님
+
+def parse_sheet(ws, pad_types:Dict[str,str], mux_exclude:Set[str])->ExcelModel:
+    g=load_grid(ws)
+    r_hdr, cmap = find_header_row(g)
+    cg, cn, ct = cmap["Pin Group"], cmap["Pin Name"], cmap["PAD type"]
+    mode_row=g[r_hdr]; sub_row=g[r_hdr+1]; om_row=g[r_hdr+2]
+    spans=detect_spans(mode_row, sub_row, om_row)
+
+    pads_I=[]; pads_IO=[]; pads_OSC=[]
+    seen=set(); ixI=0; ixO=0
+    ex_bases={strip_idx(x) for x in mux_exclude}
+
+    for r in range(r_hdr+3, len(g)):
+        row=g[r]
+        pin_raw=row[cn] if cn<len(row) else None
+        if pin_raw is None or norm(pin_raw)=="": continue
+        pin=norm(pin_raw)
+        if pin in seen: raise SpecError("F103", {"pin":pin,"row":r+1})
+        seen.add(pin)
+
+        ptype_text=norm(row[ct] if ct<len(row) else "")
+        pkey=padtype_key(ptype_text)
+        pdir=pad_types.get(pkey,"")
+        base=strip_idx(pin)
+
+        if base in ("XIN","XOUT"):
+            if base not in pads_OSC: pads_OSC.append(base)
+            continue
+
+        excluded = (pin in mux_exclude) or (base in ex_bases) or (base in FORBIDDEN_BASES)
+
+        if not pdir:
+            raise SpecError("P201", {"pad_type":ptype_text,"pin":pin,"row":r+1})
+
+        group_val=norm(row[cg] if cg<len(row) else "")
+
+        if pdir=="I":
+            pr=PadRow(r,group_val,pin,ptype_text,"I",excluded,(-1 if excluded else ixI))
+            if not excluded: pads_I.append(pr); ixI+=1
+        else:
+            pr=PadRow(r,group_val,pin,ptype_text,"IO",excluded,(-1 if excluded else ixO))
+            if not excluded: pads_IO.append(pr); ixO+=1
+
+    pin2pad={p.name:p for p in pads_I+pads_IO}
+    modes={"normal":[], "scan":[], "ipdt":[]}
+    bit_idx={"normal":0,"scan":0,"ipdt":0}
+    for (m,name),(c0,c1,omv) in sorted(spans.items(), key=lambda kv: kv[1][0]):
+        sm=SubMode(m,name,omv,[],bit_idx[m]); bit_idx[m]+=1; modes[m].append(sm)
+
+    for r in range(r_hdr+3, len(g)):
+        row=g[r]
+        pin_raw=row[cn] if cn<len(row) else None
+        if pin_raw is None or norm(pin_raw)=="": continue
+        pin=norm(pin_raw); base_pin=strip_idx(pin)
+
+        any_payload=False
+        for (_m,_n),(c0,c1,_) in spans.items():
+            for c in range(c0,c1+1):
+                if c<len(row) and row[c] not in (None,""):
+                    any_payload=True; break
+            if any_payload: break
+
+        if any_payload and (base_pin in ("XIN","XOUT") or base_pin in FORBIDDEN_BASES):
+            raise SpecError("P203", {"pin":pin,"row":r+1})
+
+        pr=pin2pad.get(pin,None)
+        if pr is None:  # excluded or OSC
+            continue
+
+        for (m,name),(c0,c1,_) in spans.items():
+            toks=[]; nonempty=False
+            for c in range(c0,c1+1):
+                if c<len(row) and row[c] not in (None,""):
+                    nonempty=True; toks+=[t for t in re.split(r"[ ,]+", str(row[c]).strip()) if t]
+            if not nonempty: continue
+
+            scname=norm(row[c0] if c0<len(row) else "")
+            if scname=="": continue
+
+            raw_base=scname; raw_en=None
+            if "/" in scname:
+                left,right=[x.strip() for x in scname.split("/",1)]
+                raw_base, raw_en = left, right
+
+            m2=re.match(r"^(?P<base>[A-Za-z_]\w*)(?:\[(?P<idx>\d+)\])?$", raw_base)
+            base_name=m2.group("base") if m2 else raw_base
+            base_idx=int(m2.group("idx")) if (m2 and m2.group("idx")) else None
+            en_idx=None
+            if raw_en:
+                m3=re.match(r"^(?P<base>[A-Za-z_]\w*)(?:\[(?P<idx>\d+)\])?$", raw_en)
+                en_idx=int(m3.group("idx")) if (m3 and m3.group("idx")) else None
+
+            marker="none"; direction=""; dflt=None; nt_ord=None
+            toks=re.split(r"[ ,]+", " ".join([str(x) for x in toks]))
+            for t in toks:
+                u=t.upper()
+                if u in ("C","R") and marker=="none": marker=u; continue
+                if u in ("I","O","IO"): direction=u; continue
+                l=t.lower()
+                if dflt is None and l in ("0","1","1'b0","1'b1"): dflt=l
+                m_nt = NT_IN_RE.fullmatch(t)
+                if m_nt: nt_ord=int(m_nt.group(1))
+            dflt = "1'b0" if dflt is None else (f"1'b{dflt}" if dflt in ("0","1") else dflt)
+
+            if pr.kind=="I" and direction in ("O","IO"):
+                raise SpecError("P202", {"pin":pin,"row":r+1,"submode":name})
+
+            cell=SigCell(base_name, base_idx, raw_en, en_idx, marker, direction or "",
+                         dflt, pr.kind, pr.index, pin, pr.row, nt_ord)
+            for sm in modes[m]:
+                if sm.name==name:
+                    sm.cells.append(cell); break
+
+    return ExcelModel(pads_I,pads_IO,pads_OSC,modes)
+
+# ---------- 유효성 ----------
+def is_valid_oe_for_base(base:str, en:str)->bool:
+    b=strip_idx(base).lower(); e=strip_idx(en).lower()
+    return e in (f"{b}_oe", f"{b}_oen", f"{b}_oe_n", f"{b}_oen_n")
+def is_active_low_oe(en:str)->bool:
+    e=strip_idx(en).lower()
+    return e.endswith("_oen") or e.endswith("_oe_n") or e.endswith("_oen_n")
+def is_oe_name(name:str)->bool:
+    e=strip_idx(name).lower()
+    return e.endswith("_oe") or e.endswith("_oen") or e.endswith("_oe_n") or e.endswith("_oen_n")
+def is_gpio_like(s:str)->bool:
+    return strip_idx(s).lower().endswith("gpio")
+
+def validate(model:ExcelModel):
+    def check(mode, subs, lo, hi):
+        seen=set()
+        for sm in subs:
+            for v in sm.om_values:
+                if not (lo<=v<=hi): raise SpecError("O301", {"mode":mode,"om":v})
+                if v in seen: raise SpecError("O302", {"mode":mode,"om":v})
+                seen.add(v)
+    check("normal", model.modes["normal"], 0,31)
+    check("scan",   model.modes["scan"],  32,47)
+    check("ipdt",   model.modes["ipdt"],  48,63)
+    for _,subs in model.modes.items():
+        for sm in subs:
+            for c in sm.cells:
+                if c.enable and not is_valid_oe_for_base(c.base, c.enable):
+                    raise SpecError("C403", {"signal":c.base,"enable":c.enable,"submode":sm.name})
+
+# ---------- GPIO-like ----------
+GPIO_BOOL = ("oen","i","pe_pu","ps_pd","st","ie")
+def gpio_like_port_entries(base:str, width:int)->List[Dict[str,str]]:
+    b=sv_id(base)
+    ent=[]
+    for nm in GPIO_BOOL:
+        ent.append({"direction":"input","type":"logic","bits":("" if width<=1 else f"[{width-1}:0]"),
+                    "name":f"{b}_{nm}","array":"","iface":""})
+    ent.append({"direction":"input","type":"logic","bits":("" if width<=1 else f"[{width-1}:0]")+"[3:0]",
+                "name":f"{b}_ds","array":"","iface":""})
+    ent.append({"direction":"output","type":"logic","bits":("" if width<=1 else f"[{width-1}:0]"),
+                "name":f"{b}_c","array":"","iface":""})
+    return ent
+
+# ---------- 맵 빌드 ----------
+def build_bus_maps_for_mode(subs: List[SubMode]):
+    sig_map={}; en_map={}
+    per_sub=[]
+    for sm in subs:
+        l_sig={}; l_dir={}
+        for c in sm.cells:
+            base=c.base
+            want="output" if c.direction=="I" else "input"
+            ent=sig_map.setdefault(base, {"dir":want,"idx":set()})
+            if ent["dir"]!=want: raise SpecError("U902", {"base":base,"mode":sm.mode})
+            if c.base_idx is not None: ent["idx"].add(c.base_idx)
+            e=l_sig.setdefault(base,set())
+            if c.base_idx is not None: e.add(c.base_idx)
+            l_dir.setdefault(base,want)
+            if l_dir[base]!=want: raise SpecError("U902", {"base":base,"mode":sm.mode})
+            if c.enable:
+                eb=strip_idx(c.enable)
+                s=en_map.setdefault(eb,set())
+                if c.enable_idx is not None: s.add(c.enable_idx)
+        per_sub.append( (sm, {b:(max(s)+1 if s else 1) for b,s in l_sig.items()}, l_dir) )
+    sig_w={b:(max(v["idx"])+1 if v["idx"] else 1) for b,v in sig_map.items()}
+    sig_dir={b:v["dir"] for b,v in sig_map.items()}
+    en_w={b:(max(v)+1 if v else 1) for b,v in en_map.items()}
+    return sig_w, sig_dir, en_w, per_sub
+
+def build_bus_maps_global(modes):
+    g_sig_w={}; g_en_w={}; g_dir={}
+    for mode in ("normal","scan","ipdt"):
+        sig_w, sig_dir, en_w, _ = build_bus_maps_for_mode(modes[mode])
+        for b,w in sig_w.items():
+            if b in g_dir and g_dir[b]!=sig_dir[b]: raise SpecError("U902", {"base":b})
+            g_sig_w[b]=max(g_sig_w.get(b,0),w); g_dir[b]=sig_dir[b]
+        for b,w in en_w.items(): g_en_w[b]=max(g_en_w.get(b,0),w)
+    return g_sig_w, g_dir, g_en_w
+
+# ---------- helpers ----------
+def en_names_for_base(base:str, en_w_map:Dict[str,int])->List[str]:
+    out=[]
+    for eb in en_w_map.keys():
+        if is_valid_oe_for_base(base, eb):
+            out.append(eb)
+    return sorted(out)
+
+# ---------- sub-mode ----------
+def gen_submode_sv(NI:int, NO:int, sm:SubMode)->str:
+    sig_map={}; en_map={}
+    for c in sm.cells:
+        base=c.base; want="output" if c.direction=="I" else "input"
+        ent=sig_map.setdefault(base, {"dir":want,"idx":set()})
+        if ent["dir"]!=want: raise SpecError("U902", {"base":base,"submode":sm.name})
+        if c.base_idx is not None: ent["idx"].add(c.base_idx)
+        if c.enable:
+            eb=strip_idx(c.enable); s=en_map.setdefault(eb,set())
+            if c.enable_idx is not None: s.add(c.enable_idx)
+    sig_w={b:(max(v["idx"])+1 if v["idx"] else 1) for b,v in sig_map.items()}
+    sig_dir={b:v["dir"] for b,v in sig_map.items()}
+    en_w={b:(max(v)+1 if v else 1) for b,v in en_map.items()}
+
+    # ---- nand_tree 특수 처리 ----
+    if sm.name.strip().lower()=="nand_tree":
+        ports=[
+            {"direction":"input","type":"logic","bits":"","name":"test_en","array":"","iface":""},
+            {"direction":"","type":"","bits":"","name":"test_in","array":f"[0:{max(0,NI-1)}]","iface":"if_pad_in.core"},
+            {"direction":"","type":"","bits":"","name":"test_io","array":f"[0:{max(0,NO-1)}]","iface":"if_pad_io.core"},
+        ]
+        L=["// Auto-generated", f"module {sv_id(sm.name)} import gpio_pkg::*; ("]
+        port_lines, _ = align_ports(ports); L+=port_lines; L.append(");\n")
+
+        IDXW_I=max(1,len(str(max(0,NI-1))))
+        IDXW_O=max(1,len(str(max(0,NO-1))))
+        FW_I=2; FW_O=5
+
+        # 입력/출력 후보 수집
+        inputs=[]   # (expr, kind, pad_index, excel_row, nt_order)
+        outputs=[]
+        for c in sm.cells:
+            use_as_input  = (c.direction in ("I","IO"))
+            use_as_output = (c.pad_kind=="IO" and c.direction in ("O","IO"))
+            if use_as_input:
+                if c.pad_kind=="I":
+                    expr = fmt_if("test_in", c.pad_index, "C", IDXW_I, 1)
+                    inputs.append((expr, "in", c.pad_index, c.excel_row, c.nt_order))
+                else:
+                    expr = fmt_if("test_io", c.pad_index, "C", IDXW_O, 1)
+                    inputs.append((expr, "io", c.pad_index, c.excel_row, c.nt_order))
+            if use_as_output:
+                outputs.append(c)
+
+        # 입력 PAD 설정(TI_*)
+        for c in sm.cells:
+            if c.direction in ("I","IO"):
+                if c.pad_kind=="I":
+                    for fld,val in (("PE","TI_PE_PU"),("PS","TI_PS_PD"),("ST","TI_ST"),("IE","TI_IE")):
+                        L.append(f"  assign {fmt_if('test_in', c.pad_index, fld, IDXW_I, FW_I)} = {val};")
+                else:
+                    for fld,val in (("PE_PU","TI_PE_PU"),("PS_PD","TI_PS_PD"),("ST","TI_ST"),("IE","TI_IE"),
+                                    ("I","TI_I"),("OEN","TI_OEN"),("DS","TI_DS")):
+                        L.append(f"  assign {fmt_if('test_io', c.pad_index, fld, IDXW_O, FW_O)} = {val};")
+        if sm.cells: L.append("")
+
+        # NAND 입력 순서: nt_order -> excel_row -> pad_index
+        inputs.sort(key=lambda x: ((x[4] if x[4] is not None else 10**9), x[3], x[2]))
+        exprs=[t[0] for t in inputs]; EW=max((len(s) for s in exprs), default=1)
+        n=len(exprs)
+        if n>=2:
+            L.append(f"  logic [{n-2}:0] nand_out;")
+            WNT=len(str(max(0,n-2)))
+            L.append(f"  primemas_lib_nand2 u_nand_000 ( .A({exprs[0].ljust(EW)}), .B({exprs[1].ljust(EW)}), .Y(nand_out{idx_r(0,WNT)}) );")
+            for k in range(2,n):
+                L.append(f"  primemas_lib_nand2 u_nand_{k:03d} ( .A(nand_out{idx_r(k-2,WNT)}), .B({exprs[k].ljust(EW)}), .Y(nand_out{idx_r(k-1,WNT)}) );")
+            final=f"nand_out{idx_r(n-2,WNT)}"
+        elif n==1:
+            final=exprs[0]
+        else:
+            final="'0'"
+
+        # 출력 PAD 구동(TO_*), test_en 없이 직결
+        for c in outputs:
+            L.append(f"  assign {fmt_if('test_io', c.pad_index, 'I', IDXW_O, FW_O)} = {final};")
+            for fld,val in (("PE_PU","TO_PE_PU"),("PS_PD","TO_PS_PD"),("ST","TO_ST"),("IE","TO_IE"),("DS","TO_DS")):
+                L.append(f"  assign {fmt_if('test_io', c.pad_index, fld, IDXW_O, FW_O)} = {val};")
+            if c.enable:
+                en=f"{sv_id(strip_idx(c.enable))}{('['+str(c.enable_idx)+']') if c.enable_idx is not None else ''}"
+                oen=en if is_active_low_oe(c.enable) else f"~{en}"
+                L.append(f"  assign {fmt_if('test_io', c.pad_index, 'OEN', IDXW_O, FW_O)} = {oen};")
+            else:
+                L.append(f"  assign {fmt_if('test_io', c.pad_index, 'OEN', IDXW_O, FW_O)} = TO_OEN;")
+        L.append("endmodule\n"); return "\n".join(L)
+
+    # ---- 일반 서브모드 ----
+    ports=[
+        {"direction":"input","type":"logic","bits":"","name":"test_en","array":"","iface":""},
+        {"direction":"","type":"","bits":"","name":"test_in","array":f"[0:{max(0,NI-1)}]","iface":"if_pad_in.core"},
+        {"direction":"","type":"","bits":"","name":"test_io","array":f"[0:{max(0,NO-1)}]","iface":"if_pad_io.core"},
+    ]
+    for base in sorted(sig_w.keys()):
+        w=sig_w[base]; dir_=sig_dir[base]
+        if is_gpio_like(base): ports+=gpio_like_port_entries(base,w)
+        ports.append({"direction":dir_, "type":"logic", "bits":("" if w<=1 else f"[{w-1}:0]"), "name":sv_id(base), "array":"", "iface":""})
+        for eb in en_names_for_base(base, en_w):
+            w_en=en_w[eb]
+            ports.append({"direction":"input","type":"logic","bits":("" if w_en<=1 else f"[{w_en-1}:0]"),"name":sv_id(eb),"array":"","iface":""})
+
+    L=["// Auto-generated", f"module {sv_id(sm.name)} import gpio_pkg::*; ("]
+    port_lines, _ = align_ports(ports); L += port_lines; L.append(");\n")
+
+    IDXW_I=max(1,len(str(max(0,NI-1))))
+    IDXW_O=max(1,len(str(max(0,NO-1))))
+    FW_I=2; FW_O=5
+
+    def oen_expr(c, def_val):
+        if not c.enable: return def_val
+        en = f"{sv_id(strip_idx(c.enable))}{('['+str(c.enable_idx)+']') if c.enable_idx is not None else ''}"
+        return en if is_active_low_oe(c.enable) else f"~{en}"
+
+    for c in sm.cells:
+        b = f"{sv_id(c.base)}[{c.base_idx}]" if c.base_idx is not None else sv_id(c.base)
+        if c.pad_kind=="I":
+            L.append(f"  assign {b}                         = test_en ? {fmt_if('test_in', c.pad_index, 'C', IDXW_I, 1)} : '0;")
+            for fld,val in (("PE","TI_PE_PU"),("PS","TI_PS_PD"),("ST","TI_ST"),("IE","TI_IE")):
+                L.append(f"  assign {fmt_if('test_in', c.pad_index, fld, IDXW_I, FW_I)} = {val};")
+        elif c.pad_kind=="IO":
+            if is_gpio_like(c.base):
+                B=sv_id(c.base)
+                L.append(f"  assign {fmt_vec(B+'_c',     c.pad_index, IDXW_O)} = test_en ? {fmt_if('test_io', c.pad_index, 'C', IDXW_O, 1)} : '0;")
+                L.append(f"  assign {fmt_if('test_io', c.pad_index, 'OEN',   IDXW_O, FW_O)} = {fmt_vec(B+'_oen',  c.pad_index, IDXW_O)};")
+                L.append(f"  assign {fmt_if('test_io', c.pad_index, 'I',     IDXW_O, FW_O)} = {fmt_vec(B+'_i',    c.pad_index, IDXW_O)};")
+                L.append(f"  assign {fmt_if('test_io', c.pad_index, 'DS',    IDXW_O, FW_O)} = {fmt_vec(B+'_ds',   c.pad_index, IDXW_O)};")
+                L.append(f"  assign {fmt_if('test_io', c.pad_index, 'PE_PU', IDXW_O, FW_O)} = {fmt_vec(B+'_pe_pu',c.pad_index, IDXW_O)};")
+                L.append(f"  assign {fmt_if('test_io', c.pad_index, 'PS_PD', IDXW_O, FW_O)} = {fmt_vec(B+'_ps_pd',c.pad_index, IDXW_O)};")
+                L.append(f"  assign {fmt_if('test_io', c.pad_index, 'ST',    IDXW_O, FW_O)} = {fmt_vec(B+'_st',   c.pad_index, IDXW_O)};")
+                L.append(f"  assign {fmt_if('test_io', c.pad_index, 'IE',    IDXW_O, FW_O)} = {fmt_vec(B+'_ie',   c.pad_index, IDXW_O)};")
+            else:
+                if c.direction in ("I","IO"):
+                    L.append(f"  assign {b}                         = test_en ? {fmt_if('test_io', c.pad_index, 'C', IDXW_O, 1)} : '0;")
+                    for fld,val in (("PE_PU","TI_PE_PU"),("PS_PD","TI_PS_PD"),("ST","TI_ST"),("IE","TI_IE"),
+                                    ("I","TI_I"),("OEN", oen_expr(c,"TI_OEN")),("DS","TI_DS")):
+                        L.append(f"  assign {fmt_if('test_io', c.pad_index, fld, IDXW_O, FW_O)} = {val};")
+                if c.direction in ("O","IO"):
+                    # *** IO 출력: test_en 게이트 없이 직결 ***
+                    L.append(f"  assign {fmt_if('test_io', c.pad_index, 'I', IDXW_O, FW_O)} = {b};")
+                    for fld,val in (("PE_PU","TO_PE_PU"),("PS_PD","TO_PS_PD"),("ST","TO_ST"),("IE","TO_IE"),
+                                    ("OEN", oen_expr(c,"TO_OEN")),("DS","TO_DS")):
+                        L.append(f"  assign {fmt_if('test_io', c.pad_index, fld, IDXW_O, FW_O)} = {val};")
+
+    L.append("endmodule\n"); return "\n".join(L)
+
+# ---------- mode mux ----------
+def short_sm_name(name:str)->str: return re.sub(r"^(normal_|scan_|ipdt_)", "", name, flags=re.I)
+
+def gen_mode_mux_sv(mode:str, NI:int, NO:int, subs:List[SubMode]):
+    sig_w_map, sig_dir_map, en_w_map, per_sub = build_bus_maps_for_mode(subs)
+
+    # 폭 불일치 검사(U903)
+    widths_by_base: Dict[str, Set[int]] = {}
+    for sm, l_sig_w, _ in per_sub:
+        for b,w in l_sig_w.items(): widths_by_base.setdefault(b,set()).add(w)
+    for b,ws in widths_by_base.items():
+        if len(ws) > 1: raise SpecError("U903", {"mode":mode, "base":b, "widths":sorted(ws)})
+
+    ports=[]; marks=[]
+
+    # A. enable & test_if
+    a0=len(ports); marks.append((a0, f"// ---- {mode.upper()} : mode_enable & test_if ----"))
+    ports.append({"direction":"input","type":"logic","bits":("" if len(subs)<=1 else f"[{len(subs)-1}:0]"),"name":f"{mode}_mode_enable","array":"","iface":""})
+    ports.append({"direction":"","type":"","bits":"","name":"test_in","array":f"[0:{max(0,NI-1)}]","iface":"if_pad_in.core"})
+    ports.append({"direction":"","type":"","bits":"","name":"test_io","array":f"[0:{max(0,NO-1)}]","iface":"if_pad_io.core"})
+
+    # 존재성 분석(기능 신호만, OE 제외)
+    present: Dict[str,int]={}
+    per_sm_sets=[]
+    for sm, l_sig_w, _ in per_sub:
+        sigs={b for b in l_sig_w.keys() if not is_oe_name(b)}
+        per_sm_sets.append((sm, sigs))
+        for b in sigs: present[b]=present.get(b,0)+1
+    shared=[b for b,cnt in present.items() if cnt>1]
+    unique_by_sm=[(sm,[b for b in s if present[b]==1]) for sm,s in per_sm_sets]
+
+    # B. shared (base 옆에 enable 포트)
+    b0=len(ports); marks.append((b0, f"// ---- shared signals across sub-modes ----"))
+    for base in sorted(shared):
+        w=sig_w_map[base]; dir_=sig_dir_map[base]
+        if is_gpio_like(base): ports+=gpio_like_port_entries(base,w)
+        ports.append({"direction":dir_, "type":"logic", "bits":("" if w<=1 else f"[{w-1}:0]"), "name":sv_id(base), "array":"", "iface":""})
+        for eb in en_names_for_base(base, en_w_map):
+            w_en=en_w_map[eb]
+            ports.append({"direction":"input","type":"logic","bits":("" if w_en<=1 else f"[{w_en-1}:0]"),"name":sv_id(eb),"array":"","iface":""})
+
+    # C. each unique block
+    for sm, lst in unique_by_sm:
+        if not lst: continue
+        c0=len(ports); marks.append((c0, f"// ---- only in {sv_id(sm.name)} ----"))
+        for base in sorted(lst):
+            w=sig_w_map[base]; dir_=sig_dir_map[base]
+            if is_gpio_like(base): ports+=gpio_like_port_entries(base,w)
+            ports.append({"direction":dir_, "type":"logic", "bits":("" if w<=1 else f"[{w-1}:0]"), "name":sv_id(base), "array":"", "iface":""})
+            for eb in en_names_for_base(base, en_w_map):
+                w_en=en_w_map[eb]
+                ports.append({"direction":"input","type":"logic","bits":("" if w_en<=1 else f"[{w_en-1}:0]"),"name":sv_id(eb),"array":"","iface":""})
+
+    L=["// Auto-generated", f"module {mode}_mux import gpio_pkg::*; ("]
+    port_lines, dir_col = align_ports(ports)
+    mark_map={i:s for (i,s) in marks}
+    for i,line in enumerate(port_lines):
+        if i in mark_map: L.append("  " + mark_map[i])
+        L.append(line)
+    L.append(");\n")
+
+    IDXW_I=max(1,len(str(max(0,NI-1))))
+    IDXW_O=max(1,len(str(max(0,NO-1))))
+    FW_I=2; FW_O=5
+
+    # submode 인티그레이션
+    out_decls=[]; out_wires_by_base={}
+    for i,(sm,l_sig_w,l_dir) in enumerate(per_sub):
+        L.append(f"  // -- integrate {sv_id(sm.name)}")
+        L.append(f"  if_pad_in.core core_{i}_in [0:{max(0,NI-1)}]();")
+        L.append(f"  if_pad_io.core core_{i}_io [0:{max(0,NO-1)}]();")
+        en_idxW=len(str(max(0,len(per_sub)-1)))
+        conns=[(".test_en", f"{mode}_mode_enable{idx_r(i, en_idxW)}"),
+               (".test_in", f"core_{i}_in"),
+               (".test_io", f"core_{i}_io")]
+        for base in sorted(l_sig_w.keys()):
+            w=l_sig_w[base]; dir_=l_dir[base]; bname=sv_id(base)
+            if dir_=="output":
+                short=sv_id(short_sm_name(sm.name)); wname=f"{short}_{bname}"
+                out_decls.append(("logic", ("" if w<=1 else f"[{w-1}:0]"), wname))
+                out_wires_by_base.setdefault(base, []).append( (i,w,wname) )
+                conns.append((f".{bname}", wname))
+            else:
+                gated=f"{mode}_mode_enable{idx_r(i, en_idxW)} ? {bname} : '0"
+                conns.append((f".{bname}", gated))
+            if is_gpio_like(base):
+                B=sv_id(base)
+                conns += [(f".{B}_oen",   f"{B}_oen"),
+                          (f".{B}_i",     f"{B}_i"),
+                          (f".{B}_pe_pu", f"{B}_pe_pu"),
+                          (f".{B}_ps_pd", f"{B}_ps_pd"),
+                          (f".{B}_st",    f"{B}_st"),
+                          (f".{B}_ie",    f"{B}_ie"),
+                          (f".{B}_ds",    f"{B}_ds"),
+                          (f".{B}_c",     f"{B}_c")]
+        for eb in sorted(en_w_map.keys()):
+            conns.append((f".{sv_id(eb)}", sv_id(eb)))
+        L.append(f"  {sv_id(sm.name)} u_{sv_id(sm.name)}")
+        L+=align_instance(conns); L.append("")
+
+    if out_decls: L+=align_decls(out_decls); L.append("")
+
+    # 출력 MUX
+    def widen(expr, wi, W):
+        if wi==W: return expr
+        return "{ " + f"{{{W-wi}{{1'b0}}}}, {expr} " + "}"
+    mux_pairs=[]
+    for base, lst in out_wires_by_base.items():
+        W = sig_w_map.get(base,1)
+        en_idxW=len(str(max(0,len(per_sub)-1)))
+        terms=[f"({mode}_mode_enable{idx_r(i, en_idxW)} ? {widen(wi_name,wi,W)} : '0)" for i,wi,wi_name in lst]
+        mux_pairs.append( (sv_id(base), " | ".join(terms) if terms else "'0") )
+    if mux_pairs: L+=align_assign_pairs(mux_pairs); L.append("")
+
+    # if_pad OR-combine + anchor
+    def or_terms(ifname, idx, field, fieldW):
+        en_idxW=len(str(max(0,len(per_sub)-1)))
+        idxT = idx_r(idx, IDXW_I if ifname=="in" else IDXW_O)
+        core = lambda i: f"core_{i}_{ifname}{idxT}.{field.ljust(fieldW)}"
+        return " | ".join([f"({mode}_mode_enable{idx_r(i, en_idxW)} ? {core(i)} : '0)" for i,_ in enumerate(per_sub)])
+    pairs=[]
+    for i in range(NI):
+        for fld in ("PE","PS","ST","IE"):
+            pairs.append((fmt_if("test_in", i, fld, IDXW_I, FW_I), or_terms("in", i, fld, FW_I)))
+    L+=align_assign_pairs(pairs); L.append("")
+    pairs=[]
+    for i in range(NO):
+        for fld in ("OEN","I","DS","PE_PU","PS_PD","ST","IE"):
+            pairs.append((fmt_if("test_io", i, fld, IDXW_O, FW_O), or_terms("io", i, fld, FW_O)))
+    L+=align_assign_pairs(pairs); L.append("")
+    decls=[]
+    if NI>0: decls.append(("logic", f"[{NI-1}:0]", "c_in"))
+    if NO>0: decls.append(("logic", f"[{NO-1}:0]", "c_io"))
+    if decls: L+=align_decls(decls); L.append("")
+    pairs=[(f"c_in{idx_r(i,IDXW_I)}", or_terms("in", i, "C", 1)) for i in range(NI)]
+    L+=align_assign_pairs(pairs)
+    pairs=[(f"c_io{idx_r(i,IDXW_O)}", or_terms("io", i, "C", 1)) for i in range(NO)]
+    L+=align_assign_pairs(pairs); L.append("")
+    for i in range(NI): L.append(f"  primemas_lib_buf z_buf_{mode}_IN_{i}_C ( .A(c_in{idx_r(i,IDXW_I)}), .Y({fmt_if('test_in', i, 'C', IDXW_I, 1)}) );")
+    for i in range(NO): L.append(f"  primemas_lib_buf z_buf_{mode}_IO_{i}_C ( .A(c_io{idx_r(i,IDXW_O)}), .Y({fmt_if('test_io', i, 'C', IDXW_O, 1)}) );")
+    L.append("endmodule\n"); return "\n".join(L), sig_w_map, sig_dir_map, en_w_map
+
+# ---------- pad mux ----------
+def gen_pad_mux_sv(model:ExcelModel, mode_maps)->str:
+    NI=len(model.pads_I); NO=len(model.pads_IO)
+    g_sig_w, g_sig_dir, g_en_w = build_bus_maps_global(model.modes)
+    gpio_like_bases={b for b in g_sig_w.keys() if is_gpio_like(b)}
+
+    ports=[]; marks=[]; added=set()
+    def add_port(entry):
+        key=(entry["direction"],entry["type"],entry["bits"],entry["name"],entry.get("iface",""),entry.get("array",""))
+        if key in added: return
+        added.add(key); ports.append(entry)
+
+    a0=len(ports); marks.append((a0, "// ---- enables ----"))
+    add_port({"direction":"input","type":"logic","bits":"[31:0]","name":"normal_mode_enable","array":"","iface":""})
+    add_port({"direction":"input","type":"logic","bits":"[15:0]","name":"scan_mode_enable",  "array":"","iface":""})
+    add_port({"direction":"input","type":"logic","bits":"[15:0]","name":"ipdt_mode_enable",  "array":"","iface":""})
+
+    for mode in ("normal","scan","ipdt"):
+        sig_w_map, sig_dir_map, en_w_map = mode_maps[mode]
+        m0=len(ports); marks.append((m0, f"// ---- {mode.capitalize()} signals ----"))
+        for base in sorted(sig_w_map.keys()):
+            W = "" if g_sig_w[base]<=1 else f"[{g_sig_w[base]-1}:0]"
+            if is_gpio_like(base):
+                for e in gpio_like_port_entries(base, g_sig_w[base]): add_port(e)
+            add_port({"direction":g_sig_dir.get(base, sig_dir_map[base]),"type":"logic","bits":W,"name":sv_id(base),"array":"","iface":""})
+            for eb in en_names_for_base(base, g_en_w):
+                W_en = "" if g_en_w[eb]<=1 else f"[{g_en_w[eb]-1}:0]"
+                add_port({"direction":"input","type":"logic","bits":W_en,"name":sv_id(eb),"array":"","iface":""})
+
+    # PAD pins
+    def vec_groups(pads):
+        g={}
+        for pr in pads:
+            m=re.match(r"^(?P<base>[A-Za-z_]\w*)(?:\[(?P<idx>\d+)\])?$", pr.name)
+            if m:
+                base=m.group("base"); idx=m.group("idx")
+                g.setdefault(base, []).append(int(idx) if idx is not None else None)
+            else:
+                g.setdefault(pr.name, []).append(None)
+        return g
+    in_g=vec_groups(model.pads_I); io_g=vec_groups(model.pads_IO)
+    def pad_digits(groups: Dict[str, List[Optional[int]]])->Dict[str,int]:
+        d={}
+        for base,idxs in groups.items():
+            mx=max([i for i in idxs if i is not None] or [0])
+            d[base]=max(3, len(str(mx)))
+        return d
+    DIG_I=pad_digits(in_g); DIG_IO=pad_digits(io_g)
+
+    p0=len(ports); marks.append((p0, "// ---- PAD pins ----"))
+    for base,idxs in sorted(in_g.items()):
+        if all(i is None for i in idxs):
+            add_port({"direction":"input","type":"logic","bits":"","name":sv_id(base),"array":"","iface":""})
+        else:
+            msb=max(i for i in idxs if i is not None); lsb=min(i for i in idxs if i is not None)
+            add_port({"direction":"input","type":"logic","bits":f"[{msb}:{lsb}]","name":sv_id(base),"array":"","iface":""})
+    for base,idxs in sorted(io_g.items()):
+        if all(i is None for i in idxs):
+            add_port({"direction":"inout","type":"logic","bits":"","name":sv_id(base),"array":"","iface":""})
+        else:
+            msb=max(i for i in idxs if i is not None); lsb=min(i for i in idxs if i is not None)
+            add_port({"direction":"inout","type":"logic","bits":f"[{msb}:{lsb}]","name":sv_id(base),"array":"","iface":""})
+    if set(model.pads_OSC)>={"XIN","XOUT"}:
+        add_port({"direction":"input","type":"logic","bits":"","name":"XIN","array":"","iface":""})
+        add_port({"direction":"output","type":"logic","bits":"","name":"XOUT","array":"","iface":""})
+
+    L=["// Auto-generated", "module pad_mux import gpio_pkg::*; ("]
+    port_lines, _ = align_ports(ports)
+    mark_map={i:s for (i,s) in marks}
+    for i,line in enumerate(port_lines):
+        if i in mark_map: L.append("  " + mark_map[i])
+        L.append(line)
+    L.append(");\n")
+
+    L.append(f"  if_pad_in.core core_normal_in  [0:{max(0,NI-1)}]();")
+    L.append(f"  if_pad_io.core core_normal_io  [0:{max(0,NO-1)}]();")
+    L.append(f"  if_pad_in.core core_scan_in    [0:{max(0,NI-1)}]();")
+    L.append(f"  if_pad_io.core core_scan_io    [0:{max(0,NO-1)}]();")
+    L.append(f"  if_pad_in.core core_ipdt_in    [0:{max(0,NI-1)}]();")
+    L.append(f"  if_pad_io.core core_ipdt_io    [0:{max(0,NO-1)}]();\n")
+    L.append(f"  if_pad_in.pad  pad_in  [0:{max(0,NI-1)}]();")
+    L.append(f"  if_pad_io.pad  pad_io  [0:{max(0,NO-1)}]();")
+    decl=[]
+    if NI>0: decl.append(("logic", f"[{NI-1}:0]", "pad_in_C"))
+    if NO>0: decl.append(("logic", f"[{NO-1}:0]", "pad_io_C"))
+    if decl: L+=align_decls(decl); L.append("")
+
+    for mode in ("normal","scan","ipdt"):
+        sig_w_map, _, en_w_map, _ = build_bus_maps_for_mode(model.modes[mode])
+        L.append(f"  // ---- integrate {mode}_mux ----")
+        conns=[(f".{mode}_mode_enable", f"{mode}_mode_enable"),
+               (".test_in", f"core_{mode}_in"),
+               (".test_io", f"core_{mode}_io")]
+        for base in sorted(sig_w_map.keys()):
+            if is_gpio_like(base):
+                B=sv_id(base)
+                conns += [(f".{B}_oen",   f"{B}_oen"),
+                          (f".{B}_i",     f"{B}_i"),
+                          (f".{B}_pe_pu", f"{B}_pe_pu"),
+                          (f".{B}_ps_pd", f"{B}_ps_pd"),
+                          (f".{B}_st",    f"{B}_st"),
+                          (f".{B}_ie",    f"{B}_ie"),
+                          (f".{B}_ds",    f"{B}_ds"),
+                          (f".{B}_c",     f"{B}_c")]
+            conns.append((f".{sv_id(base)}", sv_id(base)))
+        for eb in sorted(en_w_map.keys()):
+            conns.append((f".{sv_id(eb)}", sv_id(eb)))
+        L.append(f"  {mode}_mux u_{mode}_mux"); L+=align_instance(conns); L.append("")
+
+    IDXW_I=max(1,len(str(max(0,NI-1))))
+    IDXW_O=max(1,len(str(max(0,NO-1))))
+    FW_I=2; FW_O=5
+    L.append("  logic test_on;")
+    L.append("  assign test_on = |scan_mode_enable | |ipdt_mode_enable;")
+    def sel_expr(ifname, idx, fld, fieldW):
+        idxT = idx_r(idx, IDXW_I if ifname=="in" else IDXW_O)
+        a = f"core_scan_{ifname}{idxT}.{fld.ljust(fieldW)}"
+        b = f"core_ipdt_{ifname}{idxT}.{fld.ljust(fieldW)}"
+        c = f"core_normal_{ifname}{idxT}.{fld.ljust(fieldW)}"
+        return f"test_on ? ( |scan_mode_enable ? {a} : {b} ) : {c}"
+    pairs=[]
+    for i in range(NI):
+        for fld in ("PE","PS","ST","IE"):
+            pairs.append((fmt_if("pad_in", i, fld, IDXW_I, FW_I), sel_expr("in", i, fld, FW_I)))
+        pairs.append((fmt_if("pad_in_C", i, "", IDXW_I, 0),        sel_expr("in", i, "C", 1)))
+    L+=align_assign_pairs(pairs); L.append("")
+    pairs=[]
+    for i in range(NO):
+        for fld in ("OEN","I","DS","PE_PU","PS_PD","ST","IE"):
+            pairs.append((fmt_if("pad_io", i, fld, IDXW_O, FW_O), sel_expr("io", i, fld, FW_O)))
+        pairs.append((fmt_if("pad_io_C", i, "", IDXW_O, 0),        sel_expr("io", i, "C", 1)))
+    L+=align_assign_pairs(pairs); L.append("")
+
+    # PAD 인스턴스
+    def inst_name(kind: str, idx, base: str, bit: Optional[int], digits: int) -> str:
+        try: idx_str=f"{int(idx):03d}"
+        except Exception: idx_str=str(idx)
+        label=sv_id(base) if bit is None else f"{sv_id(base)}_{int(bit):0{digits}d}"
+        return f"u_{kind}_{idx_str}_pad_{label}"
+
+    if set(model.pads_OSC)>={"XIN","XOUT"}:
+        L.append("  // OSC PAD")
+        L.append("  primemas_lib_OSC_PAD #(.ORIENTATION(\"V\")) "
+                 f"{inst_name('0', 0, 'XIN_XOUT', None, 3)} ( .XIN(XIN), .XOUT(XOUT), .XE(pad_osc_io.XE), .DS(pad_osc_io.DS), .REF(pad_osc_ref), .RD(pad_osc_rd), .XC(pad_osc_io_XC), .RTE(1'b0) );\n")
+
+    L.append("  // IN PADs")
+    for i,pr in enumerate(model.pads_I):
+        m=re.match(r"^(?P<base>[A-Za-z_]\w*)(?:\[(?P<idx>\d+)\])?$", pr.name)
+        base=m.group('base') if m else pr.name
+        bit = int(m.group('idx')) if (m and m.group('idx') is not None) else None
+        pad_sig=f"{sv_id(base)}[{bit}]" if bit is not None else sv_id(base)
+        orient=pad_orientation(pr.pad_type)
+        name = inst_name('1', (pr.index if pr.index>=0 else i), base, bit, DIG_I.get(base,3))
+        L.append(f"  primemas_lib_IN_PAD #(.ORIENTATION(\"{orient}\")) {name}"
+                 f" ( .PAD({pad_sig}), .PE({fmt_if('pad_in', pr.index, 'PE', IDXW_I, 2)}), .PS({fmt_if('pad_in', pr.index, 'PS', IDXW_I, 2)}), .ST({fmt_if('pad_in', pr.index, 'ST', IDXW_I, 2)}), .IE({fmt_if('pad_in', pr.index, 'IE', IDXW_I, 2)}), .C({fmt_if('pad_in_C', pr.index, '', IDXW_I, 0)}), .RTE(1'b0) );")
+    L.append("")
+    L.append("  // IO PADs")
+    for i,pr in enumerate(model.pads_IO):
+        m=re.match(r"^(?P<base>[A-Za-z_]\w*)(?:\[(?P<idx>\d+)\])?$", pr.name)
+        base=m.group('base') if m else pr.name
+        bit = int(m.group('idx')) if (m and m.group('idx') is not None) else None
+        pad_sig=f"{sv_id(base)}[{bit}]" if bit is not None else sv_id(base)
+        orient=pad_orientation(pr.pad_type)
+        name = inst_name('2', (pr.index if pr.index>=0 else i), base, bit, DIG_IO.get(base,3))
+        L.append(f"  primemas_lib_IO_PAD #(.ORIENTATION(\"{orient}\")) {name}"
+                 f" ( .PAD({pad_sig}), .OEN({fmt_if('pad_io', pr.index, 'OEN',  IDXW_O, 5)}), .I({fmt_if('pad_io', pr.index, 'I', IDXW_O, 5)}), .DS({fmt_if('pad_io', pr.index, 'DS', IDXW_O, 5)}), .PE({fmt_if('pad_io', pr.index, 'PE_PU', IDXW_O, 5)}), .PS({fmt_if('pad_io', pr.index, 'PS_PD', IDXW_O, 5)}), .ST({fmt_if('pad_io', pr.index, 'ST', IDXW_O, 5)}), .IE({fmt_if('pad_io', pr.index, 'IE', IDXW_O, 5)}), .C({fmt_if('pad_io_C', pr.index, '', IDXW_O, 0)}), .RTE(1'b0) );")
+    L.append("\nendmodule\n"); return "\n".join(L)
+
+# ---------- Driver ----------
+def run_generate(xlsx_path: str, outdir: str, pad_types: Dict[str,str], mux_exclude: Set[str], sheet: Optional[str]=None):
+    wb=openpyxl.load_workbook(xlsx_path, data_only=True)
+    ws=None; last_e=None
+    if sheet:
+        if sheet in wb.sheetnames: ws=wb[sheet]
+        else: raise SpecError("F101", {"sheet": sheet})
+    else:
+        for cand in wb.worksheets:
+            try: g=load_grid(cand); find_header_row(g); ws=cand; break
+            except SpecError as e: last_e=e
+        if ws is None: raise last_e or SpecError("F101")
+
+    model=parse_sheet(ws, pad_types, mux_exclude)
+    validate(model)
+    os.makedirs(outdir, exist_ok=True)
+
+    NI=len(model.pads_I); NO=len(model.pads_IO)
+    mode_maps={}
+    for mode in ("normal","scan","ipdt"):
+        text_mux, sig_w_map, sig_dir_map, en_w_map = gen_mode_mux_sv(mode, NI, NO, model.modes[mode])
+        mdir=os.path.join(outdir,mode); os.makedirs(mdir,exist_ok=True)
+        with open(os.path.join(mdir,f"{mode}_mux.sv"),"w",encoding="utf-8") as f: f.write(text_mux)
+        mode_maps[mode]=(sig_w_map, sig_dir_map, en_w_map)
+        for sm in model.modes[mode]:
+            text_sm=gen_submode_sv(NI,NO,sm)
+            with open(os.path.join(mdir,f"{sv_id(sm.name)}.sv"),"w",encoding="utf-8") as f: f.write(text_sm)
+
+    text_top=gen_pad_mux_sv(model, mode_maps)
+    with open(os.path.join(outdir,"pad_mux.sv"),"w",encoding="utf-8") as f: f.write(text_top)
+    return ws.title, NI, NO
+
+def main():
+    import argparse, zipfile
+    ap=argparse.ArgumentParser(description="IO Mux generator (Excel -> SystemVerilog)")
+    ap.add_argument("-i","--input", required=True)
+    ap.add_argument("-o","--outdir", required=True)
+    ap.add_argument("--sheet")
+    ap.add_argument("-pad_type", dest="pad_types", nargs=2, action="append", default=[],
+                    metavar=("PAD_CELL_NAME","DIR"))
+    ap.add_argument("-mux_exclude", dest="exclude", action="append", default=[])
+    ap.add_argument("--zip", dest="zip_path")
+    args=ap.parse_args()
+
+    if not args.pad_types: raise SpecError("P201")
+    pad_map={padtype_key(n):d.upper() for (n,d) in args.pad_types}
+    sheet, NI, NO = run_generate(args.input, args.outdir, pad_map, set(args.exclude or []), sheet=args.sheet)
+
+    if args.zip_path:
+        with zipfile.ZipFile(args.zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for root, _, files in os.walk(args.outdir):
+                for fn in files:
+                    fp=os.path.join(root, fn)
+                    z.write(fp, arcname=os.path.relpath(fp, args.outdir))
+    print(f"[OK] sheet={sheet} NI={NI} NO={NO} outdir={args.outdir}")
+
+if __name__=="__main__":
+    try:
+        main()
+    except SpecError as e:
+        print(e.pretty(), file=sys.stderr); sys.exit(3)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[U901] {e}", file=sys.stderr); sys.exit(3)
