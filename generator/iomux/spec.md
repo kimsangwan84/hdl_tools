@@ -226,3 +226,176 @@ python iomux_gen.py \
 ## 12) 참고
 - 인터페이스/패키지: `if_pad_osc`, `if_pad_in`, `if_pad_io`, `gpio_pkg`(TI_/TO_ 상수 포함)
 - 향후 확장: Reset(R) 마커 동작 정의, GPIO-like 대소문자 처리 정책 등.
+
+---
+
+## 13) 인터페이스 / 패키지 정의
+
+### 13.1 if_pad_osc
+```systemverilog
+interface if_pad_osc;
+    logic           XE;
+    logic   [ 3:0]  DS;
+    logic           XC;
+
+  modport pad (
+    input           XE  ,
+    input           DS  ,
+    output          XC
+  );
+
+  modport core (
+    output          XE  ,
+    output          DS  ,
+    input           XC
+  );
+endinterface : if_pad_osc
+```
+
+### 13.2 if_pad_in
+```systemverilog
+interface if_pad_io;
+    logic           OEN;
+    logic           I;
+	  logic   [ 3:0]  DS;
+    logic           PE_PU;
+    logic           PS_PD;
+    logic           ST;
+    logic           IE;
+    logic           C;
+
+	modport pad (
+    input           OEN   , 
+    input           I     , 
+    input           DS    ,
+    input           PE_PU , 
+    input           PS_PD , 
+		input           ST    , 
+    input           IE    , 
+		output          C
+	);
+
+	modport core (
+    output          OEN   , 
+    output          I     , 
+    output          DS    ,
+    output          PE_PU , 
+    output          PS_PD , 
+		output          ST    , 
+    output          IE    , 
+		input           C
+	);
+endinterface : if_pad_io
+```
+
+### 13.3 if_pad_io
+```systemverilog
+interface if_pad_in;
+    logic           PE;
+    logic           PS;
+    logic           ST;
+    logic           IE;
+    logic           C;
+
+	modport pad (
+    input           PE  , 
+    input           PS  ,
+		input           ST  , 
+    input           IE  , 
+		output          C
+	);
+
+	modport core (
+    output          PE  , 
+    output          PS  ,
+		output          ST  , 
+    output          IE  , 
+		input           C
+	);
+endinterface : if_pad_in
+```
+
+### 13.4 gpio_pkg
+```systemverilog
+package gpio_pkg;
+  localparam    TIE_L       = 1'b0;
+  localparam    TIE_H       = 1'b1;
+
+  // GPIO Configuration Case
+  localparam    OE_DIS      = 1'b1;
+  localparam    OE_ENA      = 1'b0;
+
+  localparam    DS_0        = 4'h0;
+  localparam    DS_1        = 4'h1;
+  localparam    DS_2        = 4'h2;
+  localparam    DS_3        = 4'h3;
+  localparam    DS_4        = 4'h4;
+  localparam    DS_5        = 4'h5;
+  localparam    DS_6        = 4'h6;
+  localparam    DS_7        = 4'h7;
+  localparam    DS_8        = 4'h8;
+  localparam    DS_9        = 4'h9;
+  localparam    DS_A        = 4'ha;
+  localparam    DS_B        = 4'hb;
+  localparam    DS_C        = 4'hc;
+  localparam    DS_D        = 4'hd;
+  localparam    DS_E        = 4'he;
+  localparam    DS_F        = 4'hf;
+
+  localparam    PE_DIS      = 1'b0;
+  localparam    PE_ENA      = 1'b1;
+
+  localparam    PS_DN       = 1'b0;
+  localparam    PS_UP       = 1'b1;
+
+  localparam    PU_DIS      = 1'b0;
+  localparam    PU_ENA      = 1'b1;
+
+  localparam    PD_DIS      = 1'b0;
+  localparam    PD_ENA      = 1'b1;
+
+  localparam    ST_DIS      = 1'b0;
+  localparam    ST_ENA      = 1'b1;
+
+  localparam    IE_DIS      = 1'b0;
+  localparam    IE_ENA      = 1'b1;
+
+  localparam    XE_DIS      = 1'b0;
+  localparam    XE_ENA      = 1'b1;
+
+  // Test Input I/O configuration
+  localparam    TI_OEN      = OE_DIS;
+  localparam    TI_DS       = DS_0;
+  localparam    TI_PE_PU    = PE_DIS;
+  localparam    TI_PS_PD    = PS_DN;
+  localparam    TI_ST       = ST_DIS;
+  localparam    TI_IE       = IE_ENA;
+  localparam    TI_I        = TIE_L;
+
+  // Test Output I/O configuration
+  localparam    TO_OEN      = OE_ENA;
+  localparam    TO_DS       = DS_8;
+  localparam    TO_PE_PU    = PE_DIS;
+  localparam    TO_PS_PD    = PS_DN;
+  localparam    TO_ST       = ST_DIS;
+  localparam    TO_IE       = IE_DIS;
+
+  typedef struct packed {
+    logic                 oe;       // Output data enable     : PAD.OEN  
+    logic                 out;      // Output data            : PAD.I    
+    logic [ 3:0]          ds;       // Driving select         : PAD.DS   
+    logic                 ps_pd;    // Pull down enble        : PAD.PS/PD
+    logic                 pe_pu;    // Pull up enable         : PAD.PE/PU
+    logic                 st;       // Schmitt trigger enable : PAD.ST   
+  //logic                 fnc;      // Function
+    logic                 ie;       // Input  data enable     : PAD.IE   
+    logic                 lock;     // Control lock
+  } cfg_gpio_t;
+
+  typedef struct packed {
+    logic                 in_raw;   // Raw input data         : PAD.I    
+    logic                 in_sync;  // Input data             : PAD.I    
+  } sts_gpio_t;
+
+endpackage : gpio_pkg
+```
