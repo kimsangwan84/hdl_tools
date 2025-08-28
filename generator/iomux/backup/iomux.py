@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-iomux_gen.py — Excel → SystemVerilog IO Mux Generator
+iomux.py — Excel → SystemVerilog IO Mux Generator
 
 핵심:
 - 시트 자동 탐색( --sheet 생략 가능)
@@ -31,7 +31,7 @@ iomux_gen.py — Excel → SystemVerilog IO Mux Generator
 import os, re, sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Set
-TOOL_NAME     = "iomux_gen"
+TOOL_NAME     = "iomux"
 TOOL_VERSION  = "1.0.0"
 GEN_HEADER: List[str] = []
 
@@ -1258,6 +1258,12 @@ def run_generate(xlsx_path: str, outdir: str, pad_types: Dict[str,str], mux_excl
 def gen_testbench_sv(model: ExcelModel, mode_maps) -> str:
     NI=len(model.pads_I); NO=len(model.pads_IO)
     g_sig_w, g_sig_dir, g_en_w = build_bus_maps_global(model.modes)
+    # If any io_test submode exists, pad_mux will expose passthrough ports.
+    # In this smoke TB we intentionally leave them unconnected.
+    has_io_test_any = any(
+        any(is_io_test_name(sm.name) for sm in model.modes[m])
+        for m in ("normal","scan","ipdt")
+    )
 
     # Helpers to recover base/idx from a pin name (e.g., CFG_CHIP[1])
     def split_base_idx(pin: str):
@@ -1345,6 +1351,9 @@ def gen_testbench_sv(model: ExcelModel, mode_maps) -> str:
 
     L.append("")
     L.append("  // DUT")
+    if has_io_test_any:
+        L.append("  // Note: pad_mux exposes io_test passthrough ports (io_test_osc_io, io_test_in, io_test_io)")
+        L.append("  // These are intentionally left unconnected in this smoke testbench.")
     L.append("  pad_mux dut (")
     conns=[]
     conns.append((".normal_mode_enable","normal_mode_enable"))

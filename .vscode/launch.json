@@ -5,12 +5,23 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Python Debugger: Current File with Arguments",
+      "name": "Python: IOMUX (module entry)",
       "type": "debugpy",
       "request": "launch",
-      "program": "generator/iomux/iomux.py",
+      "module": "generator.iomux",
       "console": "integratedTerminal",
-      "args": "-i generator/iomux/operation_mode_and_test_multiplexing.xlsx -o out_iomux -mux_exclude OM -mux_exclude XIN -mux_exclude XOUT -mux_exclude PORn -pad_type PDIDWUWSWCDG I -pad_type PDXOEDG16RFRD IO -pad_type PDDWUWSWCDG IO -pad_type PDDWUWSWCDGS IO"
+      "args": [
+        "-i", "generator/iomux/operation_mode_and_test_multiplexing.xlsx",
+        "-o", "out_iomux",
+        "-mux_exclude", "OM",
+        "-mux_exclude", "XIN",
+        "-mux_exclude", "XOUT",
+        "-mux_exclude", "PORn",
+        "-pad_type", "PDIDWUWSWCDG", "I",
+        "-pad_type", "PDXOEDG16RFRD", "IO",
+        "-pad_type", "PDDWUWSWCDG", "IO",
+        "-pad_type", "PDDWUWSWCDGS", "IO"
+      ]
     }
   ]
 }
